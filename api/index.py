@@ -5,7 +5,7 @@ import os
 import httpx
 from supabase import create_client, Client
 
-app = FastAPI(title="Strava Deep Sync Pro", version="6.1.0")
+app = FastAPI(title="Strava Deep Sync Pro", version="6.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -15,7 +15,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Inisialisasi Supabase dengan pengecekan
+# Inisialisasi Supabase
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL else None
@@ -42,12 +42,8 @@ async def root():
 
 @app.get("/api/sync", tags=["Integrasi"])
 async def sync_strava():
-    """
-    Endpoint utama untuk sinkronisasi data. 
-    Menggabungkan list summary dan detail (Deep Sync).
-    """
     if not supabase:
-        return {"error": "Database Supabase tidak terhubung. Cek Environment Variables."}
+        return {"error": "Database Supabase tidak terhubung."}
     
     try:
         access_token = await get_new_access_token()
@@ -55,9 +51,8 @@ async def sync_strava():
     except Exception as e:
         return {"error": "Gagal refresh token Strava", "details": str(e)}
     
-    # Gunakan timeout yang lebih longgar karena Deep Sync melakukan banyak request
     async with httpx.AsyncClient(timeout=60.0) as client:
-        # 1. Ambil list ringkasan (Summary) - per_page 30 agar aman dari rate limit & timeout
+        # 1. Ambil list ringkasan
         list_resp = await client.get(
             "https://www.strava.com/api/v3/athlete/activities?per_page=30", 
             headers=headers
@@ -75,20 +70,20 @@ async def sync_strava():
             if not strava_id: continue
             
             try:
-                # 2. DEEP SYNC: Ambil detail lengkap untuk tiap ID (Kalori, Device, dll)
+                # 2. DEEP SYNC: Ambil detail (untuk Kalori, Device, dan LAPS/SPLITS)
                 detail_resp = await client.get(
                     f"https://www.strava.com/api/v3/activities/{strava_id}", 
                     headers=headers
                 )
                 
                 if detail_resp.status_code != 200:
-                    errors.append(f"ID {strava_id} skip: Strava detail not found.")
+                    errors.append(f"ID {strava_id} skip: Detail tidak ditemukan.")
                     continue
                     
                 act = detail_resp.json()
                 start_coords = act.get("start_latlng", [])
                 
-                # Mapping ke kolom database (Sesuai skema public.activities kamu)
+                # Mapping data lengkap ke database
                 record = {
                     "strava_id": str(act.get("id")),
                     "name": act.get("name"),
@@ -107,9 +102,12 @@ async def sync_strava():
                     "device_name": act.get("device_name"),
                     "start_lat": start_coords[0] if len(start_coords) == 2 else None,
                     "start_lng": start_coords[1] if len(start_coords) == 2 else None,
+                    
+                    # DATA LAPS MASUK KE SINI
+                    "splits_metric": act.get("splits_metric")
                 }
 
-                # Simpan ke Supabase (Upsert berdasarkan strava_id)
+                # Simpan/Update ke Supabase
                 supabase.table("activities").upsert(record, on_conflict="strava_id").execute()
                 synced_count += 1
                 
