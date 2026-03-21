@@ -4,5 +4,11 @@
       "source": "/(.*)",
       "destination": "/api/index.py"
     }
+  ],
+  "crons": [
+    {
+      "path": "/api/sync",
+      "schedule": "0 22 * * *"
+    }
   ]
 }
