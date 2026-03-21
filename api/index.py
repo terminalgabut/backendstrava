@@ -5,7 +5,7 @@ import os
 import httpx
 from supabase import create_client, Client
 
-app = FastAPI(title="Strava Hybrid Sync", version="7.0.0")
+app = FastAPI(title="Strava Hybrid Sync Pro", version="7.5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -17,7 +17,8 @@ app.add_middleware(
 
 # Inisialisasi Supabase
 supabase: Client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
-STRAVA_VERIFY_TOKEN = os.getenv("STRAVA_VERIFY_TOKEN", "my_secret_token")
+# Token verifikasi bebas, pastikan sama dengan yang ada di Env Vercel
+STRAVA_VERIFY_TOKEN = os.getenv("STRAVA_VERIFY_TOKEN", "larisehat2026")
 
 def get_wib_now():
     return datetime.now(timezone(timedelta(hours=7)))
@@ -35,7 +36,7 @@ async def get_new_access_token():
         return response.json().get("access_token")
 
 async def process_single_activity(strava_id: str, headers: dict):
-    """Fungsi inti untuk Deep Sync satu ID aktivitas."""
+    """Fungsi inti Deep Sync untuk satu aktivitas."""
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.get(f"https://www.strava.com/api/v3/activities/{strava_id}", headers=headers)
         if resp.status_code != 200: return False
@@ -66,43 +67,48 @@ async def process_single_activity(strava_id: str, headers: dict):
         supabase.table("activities").upsert(record, on_conflict="strava_id").execute()
         return True
 
-# --- ENDPOINT 1: CRON SYNC (Untuk Bulk Update) ---
-@app.get("/api/sync")
-async def sync_bulk():
-    access_token = await get_new_access_token()
-    headers = {"Authorization": f"Bearer {access_token}"}
-    
+# --- 1. SETUP WEBHOOK (Jalankan dari Chrome Android) ---
+@app.get("/api/setup-webhook")
+async def setup_webhook():
+    """Panggil ini sekali di browser untuk mendaftarkan webhook."""
     async with httpx.AsyncClient() as client:
-        list_resp = await client.get("https://www.strava.com/api/v3/athlete/activities?per_page=10", headers=headers)
-        activities = list_resp.json()
-        
-    count = 0
-    for act in activities:
-        success = await process_single_activity(act['id'], headers)
-        if success: count += 1
-            
-    return {"status": "success", "synced": count, "mode": "bulk_cron"}
+        payload = {
+            "client_id": os.getenv("STRAVA_CLIENT_ID"),
+            "client_secret": os.getenv("STRAVA_CLIENT_SECRET"),
+            "callback_url": "https://backendstrava.vercel.app/api/webhook",
+            "verify_token": STRAVA_VERIFY_TOKEN
+        }
+        resp = await client.post("https://www.strava.com/api/v3/push_subscriptions", data=payload)
+        return resp.json()
 
-# --- ENDPOINT 2: WEBHOOK VERIFICATION (Handshake) ---
+# --- 2. WEBHOOK RECEIVER (Handshake & Create Event) ---
 @app.get("/api/webhook")
 async def verify_webhook(request: Request):
     params = request.query_params
     if params.get("hub.verify_token") == STRAVA_VERIFY_TOKEN:
         return {"hub.challenge": params.get("hub.challenge")}
-    return {"error": "Unauthorized"}
+    return {"error": "Invalid Verify Token"}
 
-# --- ENDPOINT 3: WEBHOOK RECEIVER (Real-time Update) ---
 @app.post("/api/webhook")
 async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
     event = await request.json()
-    
-    # Hanya proses jika ada aktivitas baru (create)
     if event.get("object_type") == "activity" and event.get("aspect_type") == "create":
         strava_id = event.get("object_id")
         access_token = await get_new_access_token()
         headers = {"Authorization": f"Bearer {access_token}"}
-        
-        # Jalankan di background agar Strava tidak timeout (harus respon < 2 detik)
+        # Background task agar Strava tidak memutus koneksi (harus respon < 2 detik)
         background_tasks.add_task(process_single_activity, strava_id, headers)
-        
-    return {"status": "event_received"}
+    return {"status": "event_processed"}
+
+# --- 3. CRON SYNC (Backup Berkala) ---
+@app.get("/api/sync")
+async def sync_bulk():
+    access_token = await get_new_access_token()
+    headers = {"Authorization": f"Bearer {access_token}"}
+    async with httpx.AsyncClient() as client:
+        list_resp = await client.get("https://www.strava.com/api/v3/athlete/activities?per_page=10", headers=headers)
+        activities = list_resp.json()
+    count = 0
+    for act in activities:
+        if await process_single_activity(act['id'], headers): count += 1
+    return {"status": "success", "synced": count, "mode": "cron", "timestamp": get_wib_now()}
