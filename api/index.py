@@ -5,7 +5,7 @@ import os
 import httpx
 from supabase import create_client, Client
 
-app = FastAPI(title="Strava & Weather Sync Pro", version="5.0.0")
+app = FastAPI(title="Strava Deep Sync Pro", version="6.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -15,110 +15,82 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Inisialisasi Clients
-supabase: Client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY")) if os.getenv("SUPABASE_URL") else None
-
-def get_wib_now():
-    return datetime.now(timezone(timedelta(hours=7)))
-
-async def get_weather(lat, lon, dt_string):
-    """Fungsi pembantu untuk mengambil data cuaca historis (Opsional)."""
-    api_key = os.getenv("OPENWEATHER_API_KEY")
-    if not api_key or not lat or not lon:
-        return None
-    
-    # Mengubah start_date Strava ke Unix Timestamp
-    dt_obj = datetime.fromisoformat(dt_string.replace('Z', '+00:00'))
-    timestamp = int(dt_obj.timestamp())
-
-    async with httpx.AsyncClient() as client:
-        # Menggunakan OpenWeather Timemachine API (atau Current jika waktu dekat)
-        url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={api_key}&units=metric"
-        resp = await client.get(url)
-        if resp.status_code == 200:
-            w_data = resp.json()
-            return {
-                "temp": w_data.get("main", {}).get("temp"),
-                "condition": w_data.get("weather", [{}])[0].get("main")
-            }
-    return None
+# Inisialisasi Supabase
+supabase: Client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 
 async def get_new_access_token():
     async with httpx.AsyncClient() as client:
-        response = await client.post(
-            "https://www.strava.com/oauth/token",
-            data={
-                "client_id": os.getenv("STRAVA_CLIENT_ID"),
-                "client_secret": os.getenv("STRAVA_CLIENT_SECRET"),
-                "refresh_token": os.getenv("STRAVA_REFRESH_TOKEN"),
-                "grant_type": "refresh_token",
-            }
-        )
-    return response.json().get("access_token")
+        payload = {
+            "client_id": os.getenv("STRAVA_CLIENT_ID"),
+            "client_secret": os.getenv("STRAVA_CLIENT_SECRET"),
+            "refresh_token": os.getenv("STRAVA_REFRESH_TOKEN"),
+            "grant_type": "refresh_token",
+        }
+        response = await client.post("https://www.strava.com/oauth/token", data=payload)
+        return response.json().get("access_token")
 
-@app.get("/api/sync", tags=["Integrasi"])
-async def sync_strava_to_db():
-    if not supabase:
-        return {"error": "Database/Supabase belum dikonfigurasi"}
-
-    access_token = await get_new_access_token()
+@app.get("/api/sync/deep", tags=["Integrasi"])
+async def deep_sync_strava():
+    """Sync mendalam: Mengambil detail per aktivitas untuk mendapatkan Kalori & Data Lengkap."""
+    if not supabase: return {"error": "DB not connected"}
     
-    async with httpx.AsyncClient() as client:
-        headers = {"Authorization": f"Bearer {access_token}"}
-        # Mengambil 100 aktivitas terbaru (disarankan per-batch agar tidak timeout)
-        response = await client.get(
-            "https://www.strava.com/api/v3/athlete/activities?per_page=100",
+    access_token = await get_new_access_token()
+    headers = {"Authorization": f"Bearer {access_token}"}
+    
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        # 1. Ambil list ringkasan (Summary)
+        list_resp = await client.get(
+            "https://www.strava.com/api/v3/athlete/activities?per_page=30", 
             headers=headers
         )
-    
-    if response.status_code != 200:
-        return {"error": "Gagal kontak Strava", "details": response.json()}
-
-    activities = response.json()
-    synced_count = 0
-
-    for act in activities:
-        start_latlng = act.get("start_latlng", [])
-        has_coords = len(start_latlng) == 2
+        summary_activities = list_resp.json()
         
-        # 1. Logic Map & Geolocation
-        lat = start_latlng[0] if has_coords else None
-        lng = start_latlng[1] if has_coords else None
-        polyline = act.get("map", {}).get("summary_polyline")
+        synced_count = 0
+        for summary in summary_activities:
+            strava_id = summary.get("id")
+            
+            # 2. DEEP SYNC: Ambil detail lengkap untuk tiap ID
+            # Ini kunci untuk mendapatkan 'calories' dan 'device_name' yang akurat
+            detail_resp = await client.get(
+                f"https://www.strava.com/api/v3/activities/{strava_id}", 
+                headers=headers
+            )
+            
+            if detail_resp.status_code != 200:
+                continue
+                
+            act = detail_resp.json()
+            start_coords = act.get("start_latlng", [])
+            
+            # Mapping ke kolom database kamu
+            record = {
+                "strava_id": str(act.get("id")),
+                "name": act.get("name"),
+                "distance": act.get("distance"),
+                "moving_time": act.get("moving_time"),
+                "type": act.get("type"),
+                "start_date": act.get("start_date_local"),
+                "average_speed": act.get("average_speed"),
+                "max_speed": act.get("max_speed"),
+                "calories": act.get("calories"), # Sekarang terisi!
+                "total_elevation_gain": act.get("total_elevation_gain"),
+                "average_heartrate": act.get("average_heartrate"),
+                "max_heartrate": act.get("max_heartrate"),
+                "summary_polyline": act.get("map", {}).get("summary_polyline"),
+                "timezone": act.get("timezone"),
+                "device_name": act.get("device_name"), # Sekarang terisi!
+                "start_lat": start_coords[0] if len(start_coords) == 2 else None,
+                "start_lng": start_coords[1] if len(start_coords) == 2 else None,
+            }
 
-        # 2. Logic Weather (Hanya dipanggil jika data cuaca belum ada di DB)
-        weather = None
-        # Jika kamu ingin performa cepat, bagian cuaca ini bisa diproses secara async/background
-        # weather = await get_weather(lat, lng, act.get("start_date_local"))
-
-        # 3. Data Mapping Lengkap
-        data = {
-            "strava_id": str(act.get("id")),
-            "name": act.get("name"),
-            "distance": act.get("distance"),
-            "moving_time": act.get("moving_time"),
-            "elapsed_time": act.get("elapsed_time"),
-            "type": act.get("type"),
-            "start_date": act.get("start_date_local"),
-            "average_speed": act.get("average_speed"),
-            "max_speed": act.get("max_speed"),
-            "total_elevation_gain": act.get("total_elevation_gain"),
-            "summary_polyline": polyline,
-            "start_lat": lat,
-            "start_lng": lng,
-            "average_heartrate": act.get("average_heartrate"),
-            "max_heartrate": act.get("max_heartrate"),
-            "calories": act.get("calories") # Hanya muncul jika ditarik dari detail id
-        }
-
-        try:
-            supabase.table("activities").upsert(data, on_conflict="strava_id").execute()
-            synced_count += 1
-        except Exception as e:
-            print(f"Error pada ID {act.get('id')}: {e}")
+            try:
+                supabase.table("activities").upsert(record, on_conflict="strava_id").execute()
+                synced_count += 1
+            except Exception as e:
+                print(f"Error upsert {strava_id}: {e}")
 
     return {
-        "status": "success",
-        "synced": synced_count,
-        "timestamp_wib": get_wib_now().isoformat()
+        "status": "Deep Sync Berhasil",
+        "synced_count": synced_count,
+        "note": "Data kalori dan perangkat sekarang sudah masuk ke DB."
     }
