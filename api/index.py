@@ -39,74 +39,12 @@ async def get_new_access_token():
         response = await client.post("https://www.strava.com/oauth/token", data=payload)
         response.raise_for_status()
         return response.json().get("access_token")
-
-# --- ENGINES ---
-
-async def get_weather_engine(lat, lng, start_date_local=None):
-    """MENGAMBIL CUACA HISTORIS (Saat Kejadian) via Open-Meteo Archive API."""
-    fallback = {"temp": 28.0, "wind": 12.0, "hum": 65}
-    if not lat or not lng: return fallback
-    
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            if start_date_local:
-                # Parsing tanggal dan jam lari
-                dt = datetime.fromisoformat(start_date_local.replace('Z', ''))
-                date_str = dt.strftime('%Y-%m-%d')
-                hour_idx = dt.hour
-                url = f"https://archive-api.open-meteo.com/v1/archive?latitude={lat}&longitude={lng}&start_date={date_str}&end_date={date_str}&hourly=temperature_2m,relative_humidity_2m,wind_speed_10m"
-            else:
-                url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lng}&current=temperature_2m,relative_humidity_2m,wind_speed_10m"
-            
-            resp = await client.get(url)
-            if resp.status_code == 200:
-                data = resp.json()
-                if start_date_local:
-                    return {
-                        "temp": round(data['hourly']['temperature_2m'][hour_idx], 1),
-                        "wind": round(data['hourly']['wind_speed_10m'][hour_idx], 1),
-                        "hum": int(data['hourly']['relative_humidity_2m'][hour_idx])
-                    }
-                else:
-                    curr = data.get("current", {})
-                    return {
-                        "temp": round(curr.get("temperature_2m", 28.0), 1),
-                        "wind": round(curr.get("wind_speed_10m", 12.0), 1),
-                        "hum": int(curr.get("relative_humidity_2m", 65))
-                    }
-    except Exception as e:
-        print(f"Weather Engine Error: {e}")
-    return fallback
-
-async def fetch_detailed_location(lat, lng):
-    """MENGAMBIL NAMA LOKASI MANUSIAWI (Desa, Kecamatan)."""
-    if not lat or not lng: return "Global Area"
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(
-                f"https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat={lat}&lon={lng}&zoom=15",
-                headers={"Accept-Language": "id", "User-Agent": "LariSehatApp/2.0 (admin@larisehat.com)"}
-            )
-            data = resp.json()
-            addr = data.get("address", {})
-            
-            # Prioritas: Desa/Kelurahan -> Kecamatan -> Kota
-            village = addr.get("village") or addr.get("suburb") or addr.get("hamlet") or addr.get("neighbourhood") or ""
-            district = addr.get("city_district") or addr.get("district") or addr.get("town") or ""
-            
-            clean_parts = [p for p in [village, district] if p]
-            if clean_parts:
-                return ", ".join(clean_parts)
-            
-            # Jika gagal menyusun, ambil nama paling depan dari display_name
-            return data.get("display_name", "").split(',')[0] or f"{lat}, {lng}"
-    except Exception as e:
-        return f"{lat}, {lng}"
-
+        
+        
 # --- CORE LOGIC ---
 
 async def process_single_activity(strava_id: str, headers: dict):
-    """Enrichment: Strava -> Cuaca Historis -> Lokasi -> DB."""
+    """Hanya mengambil data mentah dari Strava dan menyimpannya ke Supabase."""
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.get(f"https://www.strava.com/api/v3/activities/{strava_id}", headers=headers)
         if resp.status_code != 200: return False
@@ -115,13 +53,7 @@ async def process_single_activity(strava_id: str, headers: dict):
         start_coords = act.get("start_latlng", [])
         lat = start_coords[0] if len(start_coords) == 2 else None
         lng = start_coords[1] if len(start_coords) == 2 else None
-        start_date_local = act.get("start_date_local")
-
-        # Jalankan parallel
-        location_task = fetch_detailed_location(lat, lng)
-        weather_task = get_weather_engine(lat, lng, start_date_local)
-        
-        location_name, weather_data = await asyncio.gather(location_task, weather_task)
+        start_date_local = act.get("start_date_local")      
 
         record = {
             "strava_id": str(act.get("id")),
@@ -142,33 +74,16 @@ async def process_single_activity(strava_id: str, headers: dict):
             "device_name": act.get("device_name"),
             "start_lat": lat,
             "start_lng": lng,
-            "location_name": location_name,
-            "weather_temp": weather_data["temp"],
-            "weather_wind": weather_data["wind"],
-            "weather_humidity": weather_data["hum"],
             "splits_metric": act.get("splits_metric")
         }
 
         supabase.table("activities").upsert(record, on_conflict="strava_id").execute()
         return True
 
-async def clean_old_weather_data():
-    """Update row lama yang masih pake suhu statis 28."""
-    try:
-        supabase.table("activities").update({
-            "weather_temp": None,
-            "weather_wind": None,
-            "weather_humidity": None
-        }).eq("weather_temp", 28.0).execute()
-        print("Cleanup: Data statis siap diperbarui.")
-    except Exception as e:
-        print(f"Cleanup Error: {e}")
-
 # --- ENDPOINTS ---
 
 @app.get("/api/sync")
 async def sync_bulk(background_tasks: BackgroundTasks):
-    background_tasks.add_task(clean_old_weather_data)
     access_token = await get_new_access_token()
     headers = {"Authorization": f"Bearer {access_token}"}
     
