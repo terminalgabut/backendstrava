@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timedelta, timezone
 from supabase import create_client, Client
 
-app = FastAPI(title="Strava Hybrid Sync Pro", version="7.5.0")
+app = FastAPI(title="Strava Hybrid Sync Pro", version="8.2.0")
 
 # CORS Middleware
 app.add_middleware(
@@ -42,61 +42,71 @@ async def get_new_access_token():
 
 # --- ENGINES ---
 
-async def get_weather_engine(lat, lng):
-    """Mengambil data cuaca asli dari Open-Meteo (Tanpa API Key, Anti-401)."""
+async def get_weather_engine(lat, lng, start_date_local=None):
+    """MENGAMBIL CUACA HISTORIS (Saat Kejadian) via Open-Meteo Archive API."""
     fallback = {"temp": 28.0, "wind": 12.0, "hum": 65}
-    if not lat or not lng:
-        return fallback
+    if not lat or not lng: return fallback
     
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            # Open-Meteo tidak butuh API Key
-            url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lng}&current=temperature_2m,relative_humidity_2m,wind_speed_10m"
-            resp = await client.get(url)
+            if start_date_local:
+                # Parsing tanggal dan jam lari
+                dt = datetime.fromisoformat(start_date_local.replace('Z', ''))
+                date_str = dt.strftime('%Y-%m-%d')
+                hour_idx = dt.hour
+                url = f"https://archive-api.open-meteo.com/v1/archive?latitude={lat}&longitude={lng}&start_date={date_str}&end_date={date_str}&hourly=temperature_2m,relative_humidity_2m,wind_speed_10m"
+            else:
+                url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lng}&current=temperature_2m,relative_humidity_2m,wind_speed_10m"
             
+            resp = await client.get(url)
             if resp.status_code == 200:
                 data = resp.json()
-                current = data.get("current", {})
-                return {
-                    "temp": round(current.get("temperature_2m", 28.0), 1),
-                    "wind": round(current.get("wind_speed_10m", 12.0), 1),
-                    "hum": int(current.get("relative_humidity_2m", 65))
-                }
-            else:
-                print(f"Weather Error: {resp.status_code}")
+                if start_date_local:
+                    return {
+                        "temp": round(data['hourly']['temperature_2m'][hour_idx], 1),
+                        "wind": round(data['hourly']['wind_speed_10m'][hour_idx], 1),
+                        "hum": int(data['hourly']['relative_humidity_2m'][hour_idx])
+                    }
+                else:
+                    curr = data.get("current", {})
+                    return {
+                        "temp": round(curr.get("temperature_2m", 28.0), 1),
+                        "wind": round(curr.get("wind_speed_10m", 12.0), 1),
+                        "hum": int(curr.get("relative_humidity_2m", 65))
+                    }
     except Exception as e:
-        print(f"Weather Exception: {e}")
-    
+        print(f"Weather Engine Error: {e}")
     return fallback
-    
 
 async def fetch_detailed_location(lat, lng):
-    """Menghitung lokasi dari koordinat via Nominatim (OpenStreetMap)."""
+    """MENGAMBIL NAMA LOKASI MANUSIAWI (Desa, Kecamatan)."""
     if not lat or not lng: return "Global Area"
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(
                 f"https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat={lat}&lon={lng}&zoom=15",
-                headers={"Accept-Language": "id", "User-Agent": "StravaHybridSync/1.0"}
+                headers={"Accept-Language": "id", "User-Agent": "LariSehatApp/2.0 (admin@larisehat.com)"}
             )
             data = resp.json()
             addr = data.get("address", {})
-            # Susun alamat dari yang terkecil (Desa -> Kecamatan -> Kota)
-            parts = [
-                addr.get("village") or addr.get("suburb") or addr.get("hamlet") or "",
-                addr.get("city_district") or addr.get("district") or addr.get("town") or "",
-                addr.get("city") or addr.get("regency") or addr.get("state") or ""
-            ]
-            clean_parts = [p for p in parts if p]
-            return ", ".join(clean_parts) if clean_parts else f"{lat}, {lng}"
+            
+            # Prioritas: Desa/Kelurahan -> Kecamatan -> Kota
+            village = addr.get("village") or addr.get("suburb") or addr.get("hamlet") or addr.get("neighbourhood") or ""
+            district = addr.get("city_district") or addr.get("district") or addr.get("town") or ""
+            
+            clean_parts = [p for p in [village, district] if p]
+            if clean_parts:
+                return ", ".join(clean_parts)
+            
+            # Jika gagal menyusun, ambil nama paling depan dari display_name
+            return data.get("display_name", "").split(',')[0] or f"{lat}, {lng}"
     except Exception as e:
-        print(f"Geocoding Error: {e}")
         return f"{lat}, {lng}"
 
 # --- CORE LOGIC ---
 
 async def process_single_activity(strava_id: str, headers: dict):
-    """Proses enrichment data: Ambil Strava -> Fetch Cuaca & Lokasi -> Simpan ke DB."""
+    """Enrichment: Strava -> Cuaca Historis -> Lokasi -> DB."""
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.get(f"https://www.strava.com/api/v3/activities/{strava_id}", headers=headers)
         if resp.status_code != 200: return False
@@ -105,10 +115,11 @@ async def process_single_activity(strava_id: str, headers: dict):
         start_coords = act.get("start_latlng", [])
         lat = start_coords[0] if len(start_coords) == 2 else None
         lng = start_coords[1] if len(start_coords) == 2 else None
+        start_date_local = act.get("start_date_local")
 
-        # Jalankan Engine secara paralel agar cepat
+        # Jalankan parallel
         location_task = fetch_detailed_location(lat, lng)
-        weather_task = get_weather_engine(lat, lng)
+        weather_task = get_weather_engine(lat, lng, start_date_local)
         
         location_name, weather_data = await asyncio.gather(location_task, weather_task)
 
@@ -119,7 +130,7 @@ async def process_single_activity(strava_id: str, headers: dict):
             "moving_time": act.get("moving_time"),
             "elapsed_time_seconds": act.get("elapsed_time"),
             "type": act.get("type"),
-            "start_date": act.get("start_date_local"),
+            "start_date": start_date_local,
             "average_speed": act.get("average_speed"),
             "max_speed": act.get("max_speed"),
             "calories": act.get("calories"),
@@ -138,20 +149,18 @@ async def process_single_activity(strava_id: str, headers: dict):
             "splits_metric": act.get("splits_metric")
         }
 
-        # Upsert: Update jika strava_id sudah ada, Insert jika belum ada
         supabase.table("activities").upsert(record, on_conflict="strava_id").execute()
         return True
 
 async def clean_old_weather_data():
-    """Menghapus data cuaca '28' statis agar bisa diperbarui dengan data asli."""
+    """Update row lama yang masih pake suhu statis 28."""
     try:
-        # Cari semua row yang suhunya persis 28.0 (placeholder lama)
         supabase.table("activities").update({
             "weather_temp": None,
             "weather_wind": None,
             "weather_humidity": None
         }).eq("weather_temp", 28.0).execute()
-        print("Cleanup: Data cuaca statis berhasil dikosongkan.")
+        print("Cleanup: Data statis siap diperbarui.")
     except Exception as e:
         print(f"Cleanup Error: {e}")
 
@@ -159,47 +168,34 @@ async def clean_old_weather_data():
 
 @app.get("/api/sync")
 async def sync_bulk(background_tasks: BackgroundTasks):
-    """Endpoint untuk sinkronisasi massal dan pembersihan data lama."""
-    # 1. Bersihkan data 28 derajat di background
     background_tasks.add_task(clean_old_weather_data)
-    
-    # 2. Ambil token baru
     access_token = await get_new_access_token()
     headers = {"Authorization": f"Bearer {access_token}"}
     
-    # 3. Ambil 30 aktivitas terbaru dari Strava
     async with httpx.AsyncClient() as client:
         list_resp = await client.get("https://www.strava.com/api/v3/athlete/activities?per_page=30", headers=headers)
         activities = list_resp.json()
     
     count = 0
     for act in activities:
-        # Jalankan deep sync per aktivitas
         if await process_single_activity(act['id'], headers): 
             count += 1
             
-    return {
-        "status": "success", 
-        "synced": count, 
-        "mode": "bulk_enrichment", 
-        "timestamp": get_wib_now()
-    }
+    return {"status": "success", "synced": count, "timestamp": get_wib_now()}
 
 @app.post("/api/webhook")
 async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
-    """Menerima lari baru secara otomatis dari Strava."""
+    """Menerima notifikasi otomatis dari Strava."""
     event = await request.json()
     if event.get("object_type") == "activity" and event.get("aspect_type") == "create":
         strava_id = event.get("object_id")
         access_token = await get_new_access_token()
         headers = {"Authorization": f"Bearer {access_token}"}
-        # Jalankan di background agar Strava tidak timeout
         background_tasks.add_task(process_single_activity, strava_id, headers)
     return {"status": "event_processed"}
 
 @app.get("/api/webhook")
 async def verify_webhook(request: Request):
-    """Verifikasi webhook saat setup pertama kali."""
     params = request.query_params
     if params.get("hub.verify_token") == STRAVA_VERIFY_TOKEN:
         return {"hub.challenge": params.get("hub.challenge")}
@@ -207,7 +203,6 @@ async def verify_webhook(request: Request):
 
 @app.get("/api/setup-webhook")
 async def setup_webhook():
-    """Memanggil Strava untuk mendaftarkan URL webhook ini."""
     async with httpx.AsyncClient() as client:
         payload = {
             "client_id": os.getenv("STRAVA_CLIENT_ID"),
