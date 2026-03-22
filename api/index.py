@@ -20,7 +20,9 @@ app.add_middleware(
 # --- CONFIG & CLIENTS ---
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-WEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
+# Ubah ini sementara
+# WEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY") 
+WEATHER_API_KEY = "5dee788f89a5f364fb6e184b03d13cb4" # Tulis langsung di sini
 STRAVA_VERIFY_TOKEN = os.getenv("STRAVA_VERIFY_TOKEN", "larisehat2026")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
