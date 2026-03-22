@@ -20,9 +20,6 @@ app.add_middleware(
 # --- CONFIG & CLIENTS ---
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-# Ubah ini sementara
-# WEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY") 
-WEATHER_API_KEY = "5dee788f89a5f364fb6e184b03d13cb4" # Tulis langsung di sini
 STRAVA_VERIFY_TOKEN = os.getenv("STRAVA_VERIFY_TOKEN", "larisehat2026")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -46,29 +43,32 @@ async def get_new_access_token():
 # --- ENGINES ---
 
 async def get_weather_engine(lat, lng):
-    """Mengambil data cuaca asli dari OpenWeather."""
-    # Fallback jika data tidak tersedia
+    """Mengambil data cuaca asli dari Open-Meteo (Tanpa API Key, Anti-401)."""
     fallback = {"temp": 28.0, "wind": 12.0, "hum": 65}
-    
-    if not lat or not lng or not WEATHER_API_KEY:
+    if not lat or not lng:
         return fallback
     
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            # Menggunakan API Current Weather
-            url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lng}&appid={WEATHER_API_KEY}&units=metric"
+            # Open-Meteo tidak butuh API Key
+            url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lng}&current=temperature_2m,relative_humidity_2m,wind_speed_10m"
             resp = await client.get(url)
+            
             if resp.status_code == 200:
                 data = resp.json()
+                current = data.get("current", {})
                 return {
-                    "temp": round(data["main"]["temp"], 1),
-                    "wind": round(data["wind"]["speed"] * 3.6, 1), # m/s ke km/h
-                    "hum": int(data["main"]["humidity"])
+                    "temp": round(current.get("temperature_2m", 28.0), 1),
+                    "wind": round(current.get("wind_speed_10m", 12.0), 1),
+                    "hum": int(current.get("relative_humidity_2m", 65))
                 }
+            else:
+                print(f"Weather Error: {resp.status_code}")
     except Exception as e:
-        print(f"Weather Engine Error: {e}")
+        print(f"Weather Exception: {e}")
     
     return fallback
+    
 
 async def fetch_detailed_location(lat, lng):
     """Menghitung lokasi dari koordinat via Nominatim (OpenStreetMap)."""
