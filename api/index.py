@@ -133,13 +133,16 @@ async def sync_bulk(background_tasks: BackgroundTasks):
 
 @app.post("/api/webhook")
 async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
-    """Menerima notifikasi otomatis dari Strava."""
     event = await request.json()
     if event.get("object_type") == "activity" and event.get("aspect_type") == "create":
         strava_id = event.get("object_id")
         access_token = await get_new_access_token()
         headers = {"Authorization": f"Bearer {access_token}"}
+        
+        # Tambahkan tugas update profil juga di background
+        background_tasks.add_task(get_athlete_profile, headers)
         background_tasks.add_task(process_single_activity, strava_id, headers)
+        
     return {"status": "event_processed"}
 
 @app.get("/api/webhook")
