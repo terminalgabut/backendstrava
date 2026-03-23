@@ -84,6 +84,33 @@ async def process_single_activity(strava_id: str, headers: dict):
         supabase.table("activities").upsert(record, on_conflict="strava_id").execute()
         return True
 
+async def get_athlete_profile(headers: dict):
+    """Mengambil data profil atlet dari Strava."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get("https://www.strava.com/api/v3/athlete", headers=headers)
+        if resp.status_code != 200:
+            return None
+        
+        athlete = resp.json()
+        
+        # Mapping data profil untuk Supabase
+        profile_record = {
+            "id": str(athlete.get("id")), # Strava Athlete ID
+            "username": athlete.get("username"),
+            "first_name": athlete.get("firstname"),
+            "last_name": athlete.get("lastname"),
+            "city": athlete.get("city"),
+            "state": athlete.get("state"),
+            "sex": athlete.get("sex"), # 'M' atau 'F'
+            "weight": athlete.get("weight"), # Berat badan dalam KG
+            "profile_medium": athlete.get("profile_medium"), # Foto profil
+            "updated_at": get_wib_now().isoformat()
+        }
+        
+        # Simpan ke tabel 'profiles' di Supabase
+        supabase.table("profile").upsert(profile_record, on_conflict="id").execute()
+        return profile_record
+
 # --- ENDPOINTS ---
 
 @app.get("/api/sync")
@@ -94,13 +121,15 @@ async def sync_bulk(background_tasks: BackgroundTasks):
     async with httpx.AsyncClient() as client:
         list_resp = await client.get("https://www.strava.com/api/v3/athlete/activities?per_page=30", headers=headers)
         activities = list_resp.json()
+
+    athlete_info = await get_athlete_profile(headers) 
     
     count = 0
     for act in activities:
         if await process_single_activity(act['id'], headers): 
             count += 1
             
-    return {"status": "success", "synced": count, "timestamp": get_wib_now()}
+    return {"status": "success", "athlete": athlete_info.get("first_name") if athlete_info else "Unknown", "synced": count, "timestamp": get_wib_now()}
 
 @app.post("/api/webhook")
 async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
