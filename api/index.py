@@ -74,7 +74,11 @@ async def process_single_activity(strava_id: str, headers: dict):
             "device_name": act.get("device_name"),
             "start_lat": lat,
             "start_lng": lng,
-            "splits_metric": act.get("splits_metric")
+            "splits_metric": act.get("splits_metric"),
+            "average_watts": act.get("average_watts"), # Penting untuk Ride
+            "kilojoules": act.get("kilojoules"),       # Penting untuk Ride
+            "device_watts": act.get("device_watts"),   # True jika pakai Power Meter
+            "athlete_weight": act.get("athlete_weight")
         }
 
         supabase.table("activities").upsert(record, on_conflict="strava_id").execute()
